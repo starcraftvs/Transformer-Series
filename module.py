@@ -1,6 +1,7 @@
 import torch.nn as nn
 import torch
 import torch.functional as F
+import numpy as np
 
 #尽量在forward里面直接调用层，不需要输入其他参数
 #positional embedding 还没看？？？？
@@ -32,8 +33,8 @@ class PositionalEncoding(nn.Module):
 #点乘得到attention*value的模块
 class ScaledDotProductAttention(nn.module):
     #初始化，定义drop_out和sqrt(d_k)，不过
-	def __init__(self,temperature,attn_dropout=0.1):
-        super().__init__()#继承自nn.module
+    def __init__(self,temperature,attn_dropout=0.1):
+        super.__init__() #继承自nn.module
         self.temperature=temperature  #根据公式就是sqrt(d_k)
         self.dropout=nn.Dropout(attn_dropout) #设定dropout率，返回一个类
     #前向
@@ -44,7 +45,7 @@ class ScaledDotProductAttention(nn.module):
             attn=attn.masked_fill(mask==0,-1e9) #mask里为0的赋值10^-9
         attn=self.dropout(F.softmax(attn,dim=-1)) #softmax再dropout
         output=torch.matmul(attn,v)
-        return output attn
+        return output,attn
 
 #MultiHeadAttention
 class MultiHeadAttention(nn.module):
@@ -84,7 +85,7 @@ class MultiHeadAttention(nn.module):
         #Add and Norm
         q=q.add(residual)
         q=self.layer_norm(q)
-    return q ,attn
+        return q ,attn
         
 #FeedForward
 class PositionwiseFeedForward(nn.module):
@@ -102,7 +103,7 @@ class PositionwiseFeedForward(nn.module):
         x=self.dropout(x)
         x=x.add(residual)
         x=self.layer_norm(x)
-    return x
+        return x
         
         
 #利用上面的俩实现一个Encoder Layer
@@ -115,12 +116,12 @@ class EncoderLayer(nn.module):
     def forward(self,x,slf_attn_mask=None): #输入和self attention的mask
         enc_output,enc_slf_attn=self.slf_attn(x,x,x,mask=attn_mask)
         enc_output=self.pos_ffn(enc_output)
-    return enc_output enc_slf_attn  #返回输出和自注意力
+        return enc_output,enc_slf_attn  #返回输出和自注意力
         
         
 #利用上面俩实现一个Decoder Layer和Encoder就多一个MultiheadAttention Layer，然后输入不一样
 class DecoderLayer(nn.module):
-    def __init__(self,d_model,d_innner,n_head,d_k,d_v,dropout=0.1):
+    def __init__(self,d_model,d_inner,n_head,d_k,d_v,dropout=0.1):
         super(DecoderLayer,self).__init__()
         self.slf_attn=MultiHeadAttention(n_head,d_model,d_k,d_v,dropout=dropout)
         self.enc_attn=MultiHeadAttention(n_head,d_model,d_k,d_v,dropout=dropout)
@@ -133,8 +134,8 @@ class DecoderLayer(nn.module):
         
         
 #实现整个encoder模块，包括wrod embedding,positional embedding,几个encoder layer
- class Encoder(nn.module):
-    def __init__(self,n_src_vocb,d_word_vec,n_layers,n_head,d_k,d_v,d_model,d_inner,pad_idx,dropout=0.1,n_position=200,scale_emb=False)： #最后一个是决定要不要在输入的embedding就做一个除以sqrt(d_k)的scale操作
+class Encoder(nn.module):
+    def __init__(self,n_src_vocab,d_word_vec,n_layers,n_head,d_k,d_v,d_model,d_inner,pad_idx,dropout=0.1,n_position=200,scale_emb=False): #最后一个是决定要不要在输入的embedding就做一个除以sqrt(d_k)的scale操作
         super().__init__()
         self.src_word_emb=nn.Embedding(n_src_vocab,d_word_vec,padding_idx=pad_idx)  #词典词的总数量，转换成的每个词的维度，sequence长度不一样时，少的部分补什么数字
         self.position_enc=PositionalEncoding(d_word_vec,n_position=n_position)
@@ -162,7 +163,7 @@ class DecoderLayer(nn.module):
             return enc_output,enc_slf_attn_list
         return enc_output
         
-        
+
 class Decoder(nn.module):
     def __init__(self,n_trg_vocab,d_word_vec,n_layers,n_head,d_k,d_v,d_model,d_inner,pad_idx,n_position=200,dropout=0.1,scale_emb=False):  #和上面一样
         super().__init__()
@@ -183,12 +184,12 @@ class Decoder(nn.module):
         
     #前向
     def forward(self,trg_seq,trg_mask,enc_output,src_mask,return_attns=False):
-        dec_slf_attn=[],dec_enc_attn=[]
+        dec_slf_attn_list=[],dec_enc_attn_list=[]
         #word embedding
         dec_output=self.trg_word_emb(trg_seq)
         #scale
         if self.scale_emb:
-            dec_output=dec_output*d_model**0.5
+            dec_output=dec_output*self.d_model**0.5
         #position embedding + layernorm
         dec_output=self.layer_norm(self.position_dec(dec_output))
         #过几个decdoer layer
@@ -229,8 +230,46 @@ class Transformer(nn.Module):
         #输出映射到词典
         self.trg_word_prj=nn.Linear(d_model,n_trg_vocab,bias=False)
         
+        #均匀分布初始化参数，原因见论文
         for p in self.parameters():
             if p.dim()>1:
                 nn.init.xavier_uniform_(p)
             
-            
+        assert d_model == d_word_vec #d_model就应该等于d_word_vec
+        self.x_logit_scale = 1 #对输出的结果进行scale
+        #要不要输出的词语映射和输入的word embedding共享权重。。。这种词语变换的权重感觉可以共享
+        if trg_emb_prj_weight_sharing:
+            # Share the weight between target word embedding & last dense layer
+            self.trg_word_prj.weight = self.decoder.trg_word_emb.weight
+            self.x_logit_scale = (d_model ** -0.5)    
+        #encoder的word embedding和decoder的word embedding要不要共享权重    
+        if emb_src_trg_weight_sharing:
+            self.encoder.src_word_emb.weight = self.decoder.trg_word_emb.weight
+
+    #前向
+    def forward(self, src_seq, trg_seq):
+        #encoder进的mask，把标点滤掉
+        src_mask = get_pad_mask(src_seq, self.src_pad_idx)
+        #decoder的mask，把标点滤掉，把当前时间之后不应得到的信息滤掉
+        trg_mask = get_pad_mask(trg_seq, self.trg_pad_idx) & get_subsequent_mask(trg_seq)
+        #过encoder
+        enc_output, *_ = self.encoder(src_seq, src_mask)
+        #过decoder
+        dec_output, *_ = self.decoder(trg_seq, trg_mask, enc_output, src_mask)
+        #输出映射到词典，然后scale，感觉和softmax作用差不多
+        seq_logit = self.trg_word_prj(dec_output) * self.x_logit_scale
+        #输出结果，一维化成取每个词的概率
+        return seq_logit.view(-1, seq_logit.size(2))    
+
+    #产生mask
+    def get_pad_mask(seq, pad_idx):
+        #取是标点的部分，然后加一个维度。因为对应的前面多了个n_head维度
+        return (seq != pad_idx).unsqueeze(-2)
+
+
+    def get_subsequent_mask(seq):
+        ''' For masking out the subsequent info. '''
+        sz_b, len_s = seq.size()
+        #torch.triu取上三角。1-。。取下三角，设为bool。就是滤掉还不应该得到的信息
+        subsequent_mask = (1 - torch.triu(torch.ones((1, len_s, len_s), device=seq.device), diagonal=1)).bool()
+        return subsequent_mask
